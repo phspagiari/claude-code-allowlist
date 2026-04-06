@@ -38,16 +38,17 @@ Runs before every tool call. Three-phase approval:
 - Recurses into `$()` command substitutions
 - Strips quoted strings to avoid false matches on operators
 - Checks each extracted binary against a built-in safe list
-- Validates subcommands for tools like `git`, `kubectl`, `docker`, `gcloud`, `brew`
+- **Verb-based subcommand checking** — scans all positional (non-flag) args for recognized verbs, so `kubectl -n prod get pods` works even though `get` isn't the first arg
 
-**Safety Veto.** Even when a Phase 1/2 pattern matches, the hook still blocks:
+**Safety Veto.** Runs on every Bash approval, even when a Phase 1/2 pattern matches. Always blocks:
 
 - Output redirections to files (`>`, `>>` — but allows `>/dev/null` and `>&2`)
 - `sed -i` (in-place file edit)
 - `awk -i inplace`
 - `tee` (writes to files)
-- `find -exec`/`-execdir` with dangerous binaries
+- `find -exec`/`-execdir`/`-ok`/`-okdir` with dangerous binaries
 - `xargs` with dangerous binaries
+- Unsafe subcommands for checked binaries (e.g., `kubectl delete` even if matched by a broad `Bash(kubectl *)` pattern)
 
 ### `allowlist-learn.py` (PostToolUse)
 
@@ -59,20 +60,23 @@ Runs after every tool call. When you manually press "yes" to approve something, 
 
 | Approval | Learned as |
 |----------|-----------|
-| `bazel build //target:all` | `bazel` as safe binary → matches `bazel test`, `bazel query`, etc. |
-| `terraform plan -out=tf.plan` | `terraform` as safe binary |
+| `bazel build //target:all` | `bazel` as safe binary — matches `bazel test`, `bazel query`, etc. |
 | `git stash pop` | `git stash` as safe subcommand (not all of git) |
 | `kubectl apply -f manifest.yaml` | `kubectl apply` as safe subcommand |
 | `npm run build` | `npm run` as safe subcommand |
 | `mcp__custom__my_tool` | Exact MCP tool name |
 | `Read(/path/to/project/src/main.go)` | `Read(//path/to/project/**)` (project-root pattern) |
+| `WebSearch` | Exact tool name |
+
+Learned subcommands **override built-in unsafe lists** — if you approve `kubectl apply`, the hook trusts that and auto-approves future `kubectl apply` calls.
 
 **What it never learns:**
 
-| Category | Binaries | Why |
+| Category | Examples | Why |
 |----------|----------|-----|
-| Dangerous | `rm`, `rmdir`, `mv`, `chmod`, `chown`, `chgrp`, `mkfs`, `fdisk`, `dd`, `shred`, `kill`, `killall`, `pkill`, `reboot`, `shutdown`, `sudo`, `su`, `doas` | Destructive or privilege-escalating |
-| Interpreters | `sh`, `bash`, `zsh`, `dash`, `fish`, `python`, `python3`, `node`, `deno`, `bun`, `ruby`, `perl`, `php`, `lua` | Can execute arbitrary code — the binary name tells you nothing about what it runs |
+| Dangerous binaries | `rm`, `rmdir`, `mv`, `chmod`, `chown`, `dd`, `shred`, `truncate`, `kill`, `sudo`, `su` | Destructive or privilege-escalating |
+| Interpreters | `sh`, `bash`, `zsh`, `python`, `python3`, `node`, `deno`, `bun`, `ruby`, `perl`, `npx`, `java` | Can execute arbitrary code — the binary name tells you nothing about what it runs |
+| Broad tools | `Agent`, `Write`, `Edit`, `NotebookEdit`, `WebFetch` | One specific approval shouldn't grant blanket access |
 
 Learned data is stored in `~/.claude/learned-allowlist.json`. You can inspect, edit, or delete entries at any time.
 
@@ -140,9 +144,18 @@ Note: `sed -i` and `awk -i inplace` are always blocked even though the binaries 
 </details>
 
 <details>
+<summary>Compilers</summary>
+
+`rustc`, `gcc`, `g++`, `clang`, `clang++`, `javac`, `tsc`
+
+These compile but don't execute arbitrary code.
+
+</details>
+
+<details>
 <summary>Wrappers and misc</summary>
 
-`xargs`, `time`, `seq`, `sleep`, `wait`, `man`, `info`, `help`, `gh`, `newrelic`, `colima`, `sw_vers`, `sysctl`, `launchctl`
+`xargs`, `time`, `seq`, `sleep`, `wait`, `man`, `info`, `help`, `sw_vers`, `sysctl`, `ideviceinfo`, `ideviceinstaller`, `idevicediagnostics`
 
 Note: `xargs` with a dangerous binary (e.g., `xargs rm`) is always blocked.
 
@@ -150,33 +163,178 @@ Note: `xargs` with a dangerous binary (e.g., `xargs rm`) is always blocked.
 
 ### Subcommand-checked binaries
 
-These binaries are only auto-approved when followed by a known-safe subcommand:
+These binaries use **verb-based checking** — the hook scans all positional (non-flag) args for a recognized safe verb. This means `kubectl -n prod get pods` is approved because `get` is found regardless of position.
 
-| Binary | Safe subcommands |
-|--------|-----------------|
-| `git` | `status`, `log`, `diff`, `show`, `blame`, `branch`, `remote`, `rev-parse`, `stash`, `config`, `shortlog`, `tag`, `describe`, `ls-files`, `ls-tree`, `cat-file`, `rev-list`, `name-rev`, `merge-base`, `reflog`, `grep`, `for-each-ref`, `version`, `help`, `count-objects`, `fsck` |
-| `kubectl` | `get`, `describe`, `logs`, `top`, `cluster-info`, `api-resources`, `api-versions`, `explain`, `version`, `auth`, `config`, `diff`, `rollout`, `port-forward` |
-| `gcloud` | `list`, `describe`, `info`, `version`, `auth`, `config`, `logging`, `components`, `container` |
-| `docker` | `ps`, `images`, `info`, `version`, `inspect`, `logs`, `stats`, `network`, `volume`, `port`, `top`, `diff`, `history` |
-| `brew` | `list`, `info`, `search`, `deps`, `log`, `leaves`, `outdated`, `config`, `doctor`, `services` |
+Unsafe verbs provide conflict resolution: if both a safe and unsafe verb appear (e.g., `kubectl -n get delete pod`), the unsafe verb wins — unless it was previously learned via manual approval.
 
-When you approve `git push` or `kubectl apply`, the learning hook adds those subcommands to the safe list for future sessions.
+<details>
+<summary>git — 34 safe verbs</summary>
+
+**Safe:** `status`, `log`, `diff`, `show`, `blame`, `branch`, `remote`, `rev-parse`, `stash`, `config`, `shortlog`, `tag`, `describe`, `ls-files`, `ls-tree`, `cat-file`, `rev-list`, `name-rev`, `merge-base`, `reflog`, `grep`, `for-each-ref`, `version`, `help`, `count-objects`, `fsck`, `whatchanged`, `cherry`, `range-diff`, `var`, `fetch`, `archive`, `bundle`, `notes`, `bugreport`, `diagnose`, `submodule`, `worktree`
+
+**Unsafe (always prompt):** `push`, `reset`, `clean`, `rm`, `filter-branch`, `checkout`, `switch`, `restore`
+
+</details>
+
+<details>
+<summary>kubectl — 18 safe verbs</summary>
+
+**Safe:** `get`, `describe`, `logs`, `top`, `cluster-info`, `api-resources`, `api-versions`, `explain`, `version`, `auth`, `config`, `diff`, `port-forward`, `events`, `wait`, `completion`, `options`, `plugin`, `rollout`
+
+**Unsafe (always prompt):** `delete`, `exec`, `run`, `drain`, `cp`, `attach`
+
+</details>
+
+<details>
+<summary>gcloud — verb-level, works at any depth</summary>
+
+**Safe:** `list`, `describe`, `get`, `get-credentials`, `read`, `info`, `version`, `print-access-token`, `print-identity-token`, `export`
+
+**Unsafe (always prompt):** `delete`, `ssh`, `scp`, `deploy`, `create`, `update`
+
+Works for `gcloud compute instances list`, `gcloud container clusters describe my-cluster`, etc.
+
+</details>
+
+<details>
+<summary>docker — verb-level</summary>
+
+**Safe:** `ps`, `images`, `info`, `version`, `inspect`, `logs`, `stats`, `port`, `top`, `diff`, `history`, `events`, `wait`, `search`, `ls`
+
+**Unsafe (always prompt):** `rm`, `rmi`, `kill`, `stop`, `run`, `exec`, `build`, `push`, `prune`, `load`, `import`
+
+Works for both `docker ps` and `docker container ls`.
+
+</details>
+
+<details>
+<summary>brew — 16 safe verbs</summary>
+
+**Safe:** `list`, `info`, `search`, `deps`, `log`, `leaves`, `outdated`, `config`, `doctor`, `desc`, `cat`, `formulae`, `casks`, `commands`, `home`, `uses`
+
+**Unsafe (always prompt):** `install`, `uninstall`, `remove`, `upgrade`, `reinstall`, `link`, `unlink`, `cleanup`, `autoremove`
+
+</details>
+
+<details>
+<summary>npm — 23 safe verbs</summary>
+
+**Safe:** `list`, `ls`, `info`, `view`, `show`, `outdated`, `explain`, `why`, `doctor`, `version`, `help`, `search`, `audit`, `fund`, `pack`, `prefix`, `root`, `bin`, `bugs`, `docs`, `home`, `repo`, `completion`, `access`
+
+**Unsafe (always prompt):** `install`, `uninstall`, `update`, `run`, `exec`, `start`, `test`, `publish`, `unpublish`, `link`, `ci`
+
+</details>
+
+<details>
+<summary>go — 7 safe verbs</summary>
+
+**Safe:** `version`, `env`, `list`, `doc`, `help`, `vet`, `tool`
+
+**Unsafe (always prompt):** `run`, `build`, `install`, `get`, `generate`, `test`, `clean`
+
+</details>
+
+<details>
+<summary>cargo — 14 safe verbs</summary>
+
+**Safe:** `check`, `clippy`, `doc`, `metadata`, `tree`, `search`, `version`, `help`, `audit`, `outdated`, `verify-project`, `read-manifest`, `pkgid`, `locate-project`
+
+**Unsafe (always prompt):** `build`, `run`, `install`, `test`, `bench`, `publish`, `clean`, `update`, `fix`
+
+</details>
+
+<details>
+<summary>helm — 14 safe verbs</summary>
+
+**Safe:** `list`, `get`, `status`, `show`, `history`, `template`, `lint`, `search`, `repo`, `env`, `version`, `help`, `completion`, `plugin`
+
+**Unsafe (always prompt):** `install`, `upgrade`, `uninstall`, `delete`, `rollback`, `push`, `pull`
+
+</details>
+
+<details>
+<summary>terraform — 10 safe verbs</summary>
+
+**Safe:** `version`, `validate`, `plan`, `output`, `show`, `graph`, `providers`, `state`, `workspace`, `fmt`
+
+**Unsafe (always prompt):** `apply`, `destroy`, `import`, `taint`, `untaint`, `init`
+
+</details>
+
+<details>
+<summary>gh (GitHub CLI) — verb-level</summary>
+
+**Safe:** `list`, `view`, `status`, `checks`, `diff`, `watch`, `browse`, `search`
+
+**Unsafe (always prompt):** `create`, `close`, `merge`, `comment`, `delete`, `fork`, `cancel`, `rerun`, `edit`, `add`, `remove`, `archive`, `transfer`
+
+Works for `gh pr list`, `gh issue view 123`, etc.
+
+</details>
+
+<details>
+<summary>newrelic, launchctl, colima</summary>
+
+**newrelic safe:** `query`, `search`, `list`, `describe`, `get`
+
+**launchctl safe:** `list`, `print`, `blame`, `dumpstate`, `managerpid`, `manageruid`, `managername`, `error`, `variant`, `version`
+**launchctl unsafe:** `load`, `unload`, `start`, `stop`, `enable`, `disable`, `bootstrap`, `bootout`, `kickstart`, `kill`, `submit`, `remove`
+
+**colima safe:** `status`, `list`, `version`
+**colima unsafe:** `start`, `stop`, `delete`, `restart`, `ssh`
+
+</details>
+
+### Interpreters (flag-only mode)
+
+These are in the subcommand-checked list with **empty safe sets** — meaning only bare or flag-only invocations are approved:
+
+| Command | Result |
+|---------|--------|
+| `node --version` | Approved (no positional args) |
+| `python3 -V` | Approved (no positional args) |
+| `java --version` | Approved (no positional args) |
+| `deno lint src/` | Approved (`lint` is a safe deno verb) |
+| `node script.js` | **Blocked** (positional arg, no safe verb) |
+| `python3 script.py` | **Blocked** |
+| `npx create-react-app` | **Blocked** |
+| `java -jar app.jar` | **Blocked** |
+
+Applies to: `node`, `python`, `python3`, `python2`, `ruby`, `perl`, `java`, `npx`, `deno`, `bun`
+
+`deno` has a few safe verbs: `check`, `lint`, `info`, `doc`, `types`, `completions`
 
 ## Compound Command Examples
 
-| Command | Extracted | Result |
-|---------|-----------|--------|
-| `for f in *.go; do grep pattern "$f"; done` | `grep` | Auto-approved |
-| `cd /tmp && ls -la && cat README.md` | `cd`, `ls`, `cat` | Auto-approved |
-| `kubectl get pods \| grep -v Running \| sort` | `kubectl get`, `grep`, `sort` | Auto-approved |
-| `VAR=$(git rev-parse HEAD) && echo $VAR` | `git rev-parse`, `echo` | Auto-approved |
-| `find . -name "*.go" \| head -20` | `find`, `head` | Auto-approved |
-| `for f in *.log; do rm "$f"; done` | `rm` | **Blocked** |
-| `echo data > /tmp/output.txt` | redirect to file | **Blocked** |
-| `find . -exec rm {} \;` | `-exec rm` | **Blocked** |
-| `sed -i 's/foo/bar/' file.txt` | `sed -i` | **Blocked** |
-| `cat file \| tee output.txt` | `tee` | **Blocked** |
-| `git push origin main` | `git push` (not in safe subcommands) | **Blocked** |
+| Command | What happens | Result |
+|---------|-------------|--------|
+| `for f in *.go; do grep pattern "$f"; done` | Extracts `grep` | Auto-approved |
+| `cd /tmp && ls -la && cat README.md` | Extracts `cd`, `ls`, `cat` | Auto-approved |
+| `kubectl -n prod get pods \| grep -v Running \| sort` | Extracts `kubectl get`, `grep`, `sort` | Auto-approved |
+| `VAR=$(git rev-parse HEAD) && echo $VAR` | Recurses into `$()`, extracts `git rev-parse`, `echo` | Auto-approved |
+| `find . -name "*.go" \| head -20` | Extracts `find`, `head` | Auto-approved |
+| `node --version && npm list` | `node` flag-only OK, `npm list` safe verb | Auto-approved |
+| `for f in *.log; do rm "$f"; done` | Extracts `rm` (dangerous) | **Blocked** |
+| `echo data > /tmp/output.txt` | Redirect to file detected | **Blocked** |
+| `find . -exec rm {} \;` | `-exec rm` detected | **Blocked** |
+| `find . -ok rm {} \;` | `-ok rm` detected | **Blocked** |
+| `sed -i 's/foo/bar/' file.txt` | `sed -i` detected | **Blocked** |
+| `cat file \| tee output.txt` | `tee` detected | **Blocked** |
+| `git push origin main` | `push` is unsafe git verb | **Blocked** |
+| `kubectl -n get delete pod` | `delete` is unsafe, overrides `get` | **Blocked** |
+
+## MCP Tool Learning
+
+When you approve an MCP tool call, the learning hook saves the **exact tool name**:
+
+```
+You approve: mcp__bigquery__execute_sql
+Learned:     mcp__bigquery__execute_sql (exact match)
+Result:      All future mcp__bigquery__execute_sql calls auto-approved
+             mcp__bigquery__get_table_info still prompts (different tool)
+```
+
+This works for any MCP server — observability, Slack, incident.io, ArgoCD, etc.
 
 ## Pattern Syntax Reference
 
@@ -206,7 +364,7 @@ See [`settings.example.json`](settings.example.json) for a starter set of read-o
 | `allowlist-approve.py` | `~/.claude/hooks/` | PreToolUse — auto-approves safe calls |
 | `allowlist-learn.py` | `~/.claude/hooks/` | PostToolUse — learns from manual approvals |
 | `learned-allowlist.json` | `~/.claude/` | Auto-generated — accumulated learned patterns |
-| Tracking markers | `/tmp/claude-hook-tracking-<uid>/` | Ephemeral — coordinate between the two hooks |
+| Tracking markers | `/tmp/claude-hook-tracking-<uid>/` | Ephemeral — coordinate between the two hooks (auto-cleaned) |
 
 ## Testing
 
@@ -219,12 +377,24 @@ echo '{"tool_name":"Bash","tool_input":{"command":"git log --oneline"}}' \
 echo '{"tool_name":"Bash","tool_input":{"command":"for f in *.go; do grep TODO \"$f\"; done"}}' \
   | python3 ~/.claude/hooks/allowlist-approve.py
 
+# Verb-position-independent kubectl
+echo '{"tool_name":"Bash","tool_input":{"command":"kubectl -n prod get pods"}}' \
+  | python3 ~/.claude/hooks/allowlist-approve.py
+
+# Interpreter flag-only
+echo '{"tool_name":"Bash","tool_input":{"command":"node --version"}}' \
+  | python3 ~/.claude/hooks/allowlist-approve.py
+
 # Dangerous — no output (falls through to normal prompt)
 echo '{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}' \
   | python3 ~/.claude/hooks/allowlist-approve.py
 
 # Redirect blocked even though echo is safe
 echo '{"tool_name":"Bash","tool_input":{"command":"echo secret > /tmp/leak.txt"}}' \
+  | python3 ~/.claude/hooks/allowlist-approve.py
+
+# Unsafe verb blocked even in simple command
+echo '{"tool_name":"Bash","tool_input":{"command":"kubectl delete pod my-pod"}}' \
   | python3 ~/.claude/hooks/allowlist-approve.py
 ```
 
