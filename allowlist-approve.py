@@ -8,6 +8,13 @@ Three-phase matching:
      for/while/if, pipelines, &&/||/; chains and checks every
      sub-command against a safe-binaries list.
 
+Safety veto layer runs on every Bash approval (even pattern-matched):
+  - Output redirections to files
+  - sed -i, awk -i inplace, tee
+  - find -exec/-execdir/-ok/-okdir with dangerous binaries
+  - xargs with dangerous binaries
+  - Compound commands containing any dangerous binary
+
 When auto-approving, writes a tracking marker so the PostToolUse
 learning hook knows this was NOT a manual user approval.
 """
@@ -29,6 +36,8 @@ SETTINGS_FILES = [
 ]
 
 # ── Always-safe binaries (read-only / no side-effects) ──────────────
+# These are auto-approved in compound command analysis (Phase 3).
+# NOTE: sed/awk are here because has_dangerous_flags() catches -i.
 
 SAFE_BINARIES = {
     # File reading
@@ -39,7 +48,7 @@ SAFE_BINARIES = {
     # Search & listing
     "find", "grep", "egrep", "fgrep", "rg", "ag", "fd",
     "ls", "tree", "du", "df",
-    # Text processing (stdout-only, no -i)
+    # Text processing (stdout-only — sed -i and awk -i caught separately)
     "sort", "uniq", "cut", "tr", "awk", "sed", "jq", "yq",
     "diff", "comm", "paste", "join", "column", "fmt", "fold",
     "rev", "tac", "nl", "expand", "unexpand", "base64", "iconv",
@@ -49,67 +58,182 @@ SAFE_BINARIES = {
     "whoami", "hostname", "uname", "date", "uptime", "id",
     "env", "printenv", "pwd", "type", "which", "command",
     "ps",
-    # Shell builtins / flow (safe)
+    # Shell builtins / flow
     "export", "local", "declare", "set", "test", "[", "[[",
     "cd", "pushd", "popd",
-    # Version / info
-    "node", "npm", "npx", "go", "python", "python3",
-    "java", "rustc", "cargo", "ruby", "perl",
-    "man", "info", "help",
-    # Safe wrappers
+    # Compilers (compile but don't execute arbitrary code)
+    "rustc", "gcc", "g++", "clang", "clang++", "javac", "tsc",
+    # Safe wrappers (xargs checked separately for dangerous inner binary)
     "xargs", "time", "seq", "sleep", "wait",
-    # macOS / misc
+    # Version / info
+    "man", "info", "help",
+    # macOS
     "ideviceinfo", "ideviceinstaller", "idevicediagnostics",
-    "colima", "sw_vers", "sysctl", "launchctl",
-    "newrelic", "gh",
+    "sw_vers", "sysctl",
 }
 
-# Binaries that need subcommand validation
+# ── Subcommand-checked binaries ─────────────────────────────────────
+# Only auto-approved when a known-safe VERB is found among the
+# positional (non-flag) args. This handles patterns like
+# "kubectl -n prod get pods" where flags precede the verb.
+#
+# Interpreters (node, python3, etc.) have EMPTY safe sets, meaning
+# only bare/flag-only invocations pass (e.g., "node --version").
+
 SUBCOMMAND_SAFE = {
     "git": {
         "status", "log", "diff", "show", "blame", "branch", "remote",
         "rev-parse", "stash", "config", "shortlog", "tag", "describe",
         "ls-files", "ls-tree", "cat-file", "rev-list", "name-rev",
         "merge-base", "reflog", "grep", "for-each-ref", "version",
-        "help", "count-objects", "fsck",
+        "help", "count-objects", "fsck", "whatchanged", "cherry",
+        "range-diff", "var", "fetch", "archive", "bundle", "notes",
+        "bugreport", "diagnose", "submodule", "worktree",
     },
     "kubectl": {
         "get", "describe", "logs", "top", "cluster-info", "api-resources",
         "api-versions", "explain", "version", "auth", "config", "diff",
-        "rollout", "port-forward",
+        "port-forward", "events", "wait", "completion", "options",
+        "plugin", "rollout",
     },
     "gcloud": {
-        "list", "describe", "info", "version", "auth", "config",
-        "logging", "components", "container",
+        # Verb-level (works at any depth: gcloud <group...> <verb>)
+        "list", "describe", "get", "get-credentials", "read",
+        "info", "version", "print-access-token", "print-identity-token",
+        "export",
     },
     "docker": {
+        # Verb-level (works for both "docker ps" and "docker container ls")
         "ps", "images", "info", "version", "inspect", "logs",
-        "stats", "network", "volume", "port", "top", "diff", "history",
+        "stats", "port", "top", "diff", "history", "events",
+        "wait", "search", "ls",
     },
     "brew": {
         "list", "info", "search", "deps", "log", "leaves", "outdated",
-        "config", "doctor", "services",
+        "config", "doctor", "desc", "cat", "formulae", "casks",
+        "commands", "home", "uses",
+    },
+    "npm": {
+        "list", "ls", "info", "view", "show", "outdated", "explain",
+        "why", "doctor", "version", "help", "search", "audit", "fund",
+        "pack", "prefix", "root", "bin", "bugs", "docs", "home",
+        "repo", "completion", "access",
+    },
+    "go": {
+        "version", "env", "list", "doc", "help", "vet", "tool",
+    },
+    "cargo": {
+        "check", "clippy", "doc", "metadata", "tree", "search",
+        "version", "help", "audit", "outdated", "verify-project",
+        "read-manifest", "pkgid", "locate-project",
+    },
+    "helm": {
+        "list", "get", "status", "show", "history", "template",
+        "lint", "search", "repo", "env", "version", "help",
+        "completion", "plugin",
+    },
+    "terraform": {
+        "version", "validate", "plan", "output", "show", "graph",
+        "providers", "state", "workspace", "fmt",
+    },
+    "gh": {
+        # Verb-level (works for "gh pr list", "gh issue view", etc.)
+        "list", "view", "status", "checks", "diff", "watch",
+        "browse", "search",
+    },
+    "newrelic": {
+        "query", "search", "list", "describe", "get",
+    },
+    "launchctl": {
+        "list", "print", "blame", "dumpstate", "managerpid",
+        "manageruid", "managername", "error", "variant", "version",
+    },
+    "colima": {
+        "status", "list", "version",
+    },
+    # Interpreters — empty safe set means only flag-only calls pass
+    # (e.g., "node --version" OK, "node script.js" blocked)
+    "node": set(),
+    "python": set(),
+    "python3": set(),
+    "python2": set(),
+    "ruby": set(),
+    "perl": set(),
+    "java": set(),
+    "npx": set(),
+    "deno": {"check", "lint", "info", "doc", "types", "completions"},
+    "bun": set(),
+}
+
+# ── Known-unsafe subcommands ────────────────────────────────────────
+# Used for conflict resolution: if BOTH a safe and unsafe verb appear
+# in the positional args (e.g., "kubectl -n get delete pod"), the
+# unsafe verb wins. Learned verbs override these (user approval >
+# built-in caution).
+
+SUBCOMMAND_UNSAFE = {
+    "git": {
+        "push", "reset", "clean", "rm", "filter-branch",
+        "checkout", "switch", "restore",
+    },
+    "kubectl": {
+        "delete", "exec", "run", "drain", "cp", "attach",
+    },
+    "gcloud": {
+        "delete", "ssh", "scp", "deploy", "create", "update",
+    },
+    "docker": {
+        "rm", "rmi", "kill", "stop", "run", "exec", "build",
+        "push", "prune", "load", "import",
+    },
+    "brew": {
+        "install", "uninstall", "remove", "upgrade", "reinstall",
+        "link", "unlink", "cleanup", "autoremove",
+    },
+    "npm": {
+        "install", "uninstall", "update", "run", "exec", "start",
+        "test", "publish", "unpublish", "link", "ci",
+    },
+    "go": {
+        "run", "build", "install", "get", "generate", "test", "clean",
+    },
+    "cargo": {
+        "build", "run", "install", "test", "bench", "publish",
+        "clean", "update", "fix",
+    },
+    "helm": {
+        "install", "upgrade", "uninstall", "delete", "rollback",
+        "push", "pull",
+    },
+    "terraform": {
+        "apply", "destroy", "import", "taint", "untaint", "init",
+    },
+    "gh": {
+        "create", "close", "merge", "comment", "delete", "fork",
+        "cancel", "rerun", "edit", "add", "remove", "archive",
+        "transfer",
+    },
+    "launchctl": {
+        "load", "unload", "start", "stop", "enable", "disable",
+        "bootstrap", "bootout", "kickstart", "kill", "submit", "remove",
+    },
+    "colima": {
+        "start", "stop", "delete", "restart", "ssh",
     },
 }
 
-# Never auto-approve these
+# ── Never auto-approve these binaries ───────────────────────────────
+
 DANGEROUS_BINARIES = {
     "rm", "rmdir", "mv", "chmod", "chown", "chgrp",
-    "mkfs", "fdisk", "dd", "shred",
+    "mkfs", "fdisk", "dd", "shred", "truncate",
     "kill", "killall", "pkill",
     "reboot", "shutdown", "halt", "poweroff",
     "sudo", "su", "doas",
 }
 
-# Interpreters — can run arbitrary code, never learn as "safe binary"
-INTERPRETERS = {
-    "sh", "bash", "zsh", "dash", "fish", "csh", "tcsh",
-    "python", "python3", "python2",
-    "node", "deno", "bun",
-    "ruby", "perl", "php", "lua",
-}
+# ── Shell keywords — not binaries, skip during extraction ───────────
 
-# Shell keywords — not binaries, skip during extraction
 SHELL_KEYWORDS = {
     "for", "while", "until", "if", "then", "else", "elif",
     "fi", "do", "done", "case", "esac", "in", "select",
@@ -158,7 +282,7 @@ def load_learned():
         return default
 
 
-# ── Pattern matching (original behaviour, kept intact) ──────────────
+# ── Pattern matching (same format as permissions.allow) ─────────────
 
 def matches(tool_name, tool_input, pattern):
     """Check if a tool call matches an allowlist pattern."""
@@ -243,7 +367,7 @@ def remove_quoted(s):
 def is_compound(command):
     """Check if command contains pipes, semicolons, or compound operators."""
     cleaned = remove_quoted(command)
-    return bool(re.search(r"[|;]|&&", cleaned))
+    return bool(re.search(r"[;]|\||&&|\|\|", cleaned))
 
 
 def find_potential_binaries(command):
@@ -300,7 +424,7 @@ def find_potential_binaries(command):
             elif cmd is not None:
                 args.append(w)
         if cmd and not re.match(r"^\d+$", cmd):
-            binaries.append((cmd, args[:5]))
+            binaries.append((cmd, args[:10]))
 
     return binaries
 
@@ -328,8 +452,8 @@ def has_dangerous_flags(command):
     # tee writes to files
     if re.search(r"\btee\b", cleaned):
         return True, "tee (writes to files)"
-    # find -exec/-execdir with dangerous binary
-    for m in re.finditer(r"-(?:exec|execdir)\s+(\S+)", cleaned):
+    # find -exec/-execdir/-ok/-okdir with dangerous binary
+    for m in re.finditer(r"-(?:exec|execdir|ok|okdir)\s+(\S+)", cleaned):
         if os.path.basename(m.group(1)) in DANGEROUS_BINARIES:
             return True, f"-exec {m.group(1)}"
     # xargs with dangerous binary
@@ -354,7 +478,8 @@ def is_safe_command(command, learned):
 
     learned_bins = set(learned.get("safe_binaries", {}).keys())
     learned_subcmds = learned.get("safe_subcommands", {})
-    all_safe = SAFE_BINARIES | learned_bins
+    # Defense in depth: never trust learned entries for dangerous binaries
+    all_safe = (SAFE_BINARIES | learned_bins) - DANGEROUS_BINARIES
 
     for binary, args in binaries:
         if binary in DANGEROUS_BINARIES:
@@ -369,26 +494,31 @@ def is_safe_command(command, learned):
         # find -exec: check the command it runs
         if binary == "find":
             for i, a in enumerate(args):
-                if a in ("-exec", "-execdir") and i + 1 < len(args):
+                if a in ("-exec", "-execdir", "-ok", "-okdir") and i + 1 < len(args):
                     inner = os.path.basename(args[i + 1])
                     if inner in DANGEROUS_BINARIES:
-                        return False, f"find -exec runs dangerous: {inner}"
+                        return False, f"find {a} runs dangerous: {inner}"
 
-        # Subcommand-checked binaries
+        # Subcommand-checked binaries: scan all positional args for verbs
         if binary in SUBCOMMAND_SAFE:
-            # Find first non-flag arg (the subcommand)
-            subcmd = None
-            for a in args:
-                if not a.startswith("-"):
-                    subcmd = a
-                    break
-            if subcmd is None:
-                continue  # No subcommand (e.g. bare "git") — allow, it'll just print help
-            builtin_ok = SUBCOMMAND_SAFE[binary]
+            non_flag_args = [a for a in args if not a.startswith("-")]
+            builtin_safe = SUBCOMMAND_SAFE[binary]
             learned_ok = set(learned_subcmds.get(binary, []))
-            if subcmd not in builtin_ok and subcmd not in learned_ok:
-                return False, f"{binary} {subcmd} not in safe list"
-            continue
+            safe_verbs = builtin_safe | learned_ok
+            # Learned verbs override built-in unsafe (user approved them)
+            unsafe_verbs = SUBCOMMAND_UNSAFE.get(binary, set()) - learned_ok
+
+            found_unsafe = next((a for a in non_flag_args if a in unsafe_verbs), None)
+            found_safe = any(a in safe_verbs for a in non_flag_args)
+
+            if found_safe and found_unsafe:
+                # Conflict: e.g., "kubectl -n get delete pod" — unsafe wins
+                return False, f"{binary} {found_unsafe} (unsafe) overrides safe match"
+            if found_safe:
+                continue  # This binary is OK
+            if not non_flag_args:
+                continue  # Bare command or flags-only (e.g., "node --version")
+            return False, f"{binary}: no safe verb in {non_flag_args[:3]}"
 
         # Regular binary check
         if binary not in all_safe:
@@ -402,8 +532,12 @@ def is_safe_command(command, learned):
 def _bash_safety_veto(tool_name, tool_input, learned):
     """Return True if a Bash pattern match should be VETOED for safety.
 
-    Always blocks redirects and dangerous flags (sed -i, tee).
-    For compound commands (pipes, ;, &&) also runs full analysis.
+    Always blocks:
+    - Output redirections to files
+    - Dangerous flags (sed -i, tee, find -exec rm, etc.)
+    - Unsafe subcommands in subcommand-checked binaries
+    - Compound commands containing any unsafe element
+
     Non-Bash tools are never vetoed.
     """
     if tool_name != "Bash":
@@ -418,6 +552,25 @@ def _bash_safety_veto(tool_name, tool_input, learned):
     dangerous, _ = has_dangerous_flags(command)
     if dangerous:
         return True
+
+    # Check for unsafe subcommands even in simple commands
+    # (e.g., "kubectl -n get delete pod" matched by "Bash(kubectl * get *)")
+    binaries = find_potential_binaries(command)
+    learned_subcmds = learned.get("safe_subcommands", {})
+    for binary, args in binaries:
+        if binary in DANGEROUS_BINARIES:
+            return True
+        if binary in SUBCOMMAND_SAFE:
+            non_flag_args = [a for a in args if not a.startswith("-")]
+            learned_ok = set(learned_subcmds.get(binary, []))
+            safe_verbs = SUBCOMMAND_SAFE[binary] | learned_ok
+            unsafe_verbs = SUBCOMMAND_UNSAFE.get(binary, set()) - learned_ok
+            # Find the FIRST recognized verb (safe or unsafe)
+            for a in non_flag_args:
+                if a in unsafe_verbs:
+                    return True  # First recognized verb is unsafe → veto
+                if a in safe_verbs:
+                    break  # First recognized verb is safe → OK, stop checking
 
     # For compound commands, full safety analysis
     if is_compound(command):
@@ -440,16 +593,17 @@ def write_tracking(tool_name, tool_input):
             f.write("1")
     except OSError:
         pass
-    # Garbage-collect markers older than 1 hour
-    try:
-        import time
-        now = time.time()
-        for name in os.listdir(TRACKING_DIR):
-            p = os.path.join(TRACKING_DIR, name)
-            if now - os.path.getmtime(p) > 3600:
-                os.remove(p)
-    except OSError:
-        pass
+    # Probabilistic GC: ~1 in 20 calls, clean markers older than 1 hour
+    if int(h[0], 16) == 0:
+        try:
+            import time
+            now = time.time()
+            for name in os.listdir(TRACKING_DIR):
+                p = os.path.join(TRACKING_DIR, name)
+                if now - os.path.getmtime(p) > 3600:
+                    os.remove(p)
+        except OSError:
+            pass
 
 
 # ── Output ──────────────────────────────────────────────────────────

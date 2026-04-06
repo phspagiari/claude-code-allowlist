@@ -12,10 +12,14 @@ Learning strategy:
     - For subcommand tools (git, kubectl, etc.) learns binary+subcommand
     - For regular tools learns the binary as safe
     - Never learns interpreters (sh, python3, etc.) as safe binaries
-  MCP / other tools:
+    - Never learns dangerous binaries (rm, mv, etc.)
+    - Skips loop headers to avoid learning loop variables as binaries
+  MCP tools:
     - Learns the exact tool name
-  Read / Edit / Write:
+  Read:
     - Learns a path-prefix pattern from the file's project directory
+  Edit / Write / Agent / WebFetch:
+    - NOT learned (too broad — one approval shouldn't grant blanket access)
 """
 
 import sys
@@ -29,19 +33,24 @@ HOME = os.path.expanduser("~")
 TRACKING_DIR = f"/tmp/claude-hook-tracking-{os.getuid()}"
 LEARNED_FILE = os.path.join(HOME, ".claude", "learned-allowlist.json")
 
-# Keep in sync with allowlist-approve.py
-SUBCOMMAND_BINARIES = {"git", "kubectl", "gcloud", "docker", "brew", "npm", "cargo", "go"}
+# Keep in sync with SUBCOMMAND_SAFE keys in allowlist-approve.py
+# (excluding interpreters — those are caught by INTERPRETERS below)
+SUBCOMMAND_BINARIES = {
+    "git", "kubectl", "gcloud", "docker", "brew", "npm", "go", "cargo",
+    "helm", "terraform", "gh", "newrelic", "launchctl", "colima",
+}
 
 INTERPRETERS = {
     "sh", "bash", "zsh", "dash", "fish", "csh", "tcsh",
     "python", "python3", "python2",
     "node", "deno", "bun",
     "ruby", "perl", "php", "lua",
+    "npx", "java",
 }
 
 DANGEROUS_BINARIES = {
     "rm", "rmdir", "mv", "chmod", "chown", "chgrp",
-    "mkfs", "fdisk", "dd", "shred",
+    "mkfs", "fdisk", "dd", "shred", "truncate",
     "kill", "killall", "pkill",
     "reboot", "shutdown", "halt", "poweroff",
     "sudo", "su", "doas",
@@ -52,6 +61,10 @@ SHELL_KEYWORDS = {
     "fi", "do", "done", "case", "esac", "in", "select",
     "function", "time",
 }
+
+# Tools that should never be globally learned
+# (one approval of a specific invocation != blanket trust)
+TOOL_NEVER_LEARN = {"Agent", "Write", "Edit", "NotebookEdit", "WebFetch"}
 
 
 def was_auto_approved(tool_name, tool_input):
@@ -98,8 +111,8 @@ def save_learned(data):
 def extract_binaries_simple(command):
     """Lightweight binary extraction for learning.
 
-    Splits on separators, skips shell keywords/assignments/flags,
-    returns list of (binary_name, [args]) tuples.
+    Splits on separators, skips shell keywords/assignments/flags
+    and loop headers, returns list of (binary_name, [args]) tuples.
     """
     # Remove quoted strings
     cleaned = re.sub(r'"[^"]*"', '""', command)
@@ -112,6 +125,15 @@ def extract_binaries_simple(command):
 
     for seg in segments:
         words = seg.strip().split()
+        if not words:
+            continue
+
+        first = words[0].strip("(){}$`")
+
+        # Skip loop/conditional headers (avoids learning loop variables)
+        if first in ("for", "while", "until", "case"):
+            continue
+
         cmd = None
         args = []
         for w in words:
@@ -129,9 +151,9 @@ def extract_binaries_simple(command):
             elif cmd is not None:
                 args.append(w)
         if cmd and not re.match(r"^\d+$", cmd):
-            results.append((cmd, args[:3]))
+            results.append((cmd, args[:5]))
 
-    # Also extract from $() substitutions
+    # Also extract from $() substitutions in the original command
     for sub in re.findall(r"\$\(([^)]+)\)", command):
         results.extend(extract_binaries_simple(sub))
 
@@ -154,13 +176,13 @@ def learn_from_bash(command, learned):
             continue
 
         if binary in SUBCOMMAND_BINARIES:
-            # Find the subcommand (first non-flag arg)
-            subcmd = None
-            for a in args:
-                if not a.startswith("-"):
-                    subcmd = a
-                    break
-            if subcmd:
+            # Find the verb among positional (non-flag) args
+            non_flag_args = [a for a in args if not a.startswith("-")]
+            for subcmd in non_flag_args:
+                # Only learn the first plausible verb (skip resource names etc.)
+                # A verb is typically a short lowercase word
+                if len(subcmd) > 30 or "/" in subcmd or "." in subcmd:
+                    continue
                 if binary not in learned["safe_subcommands"]:
                     learned["safe_subcommands"][binary] = []
                 if subcmd not in learned["safe_subcommands"][binary]:
@@ -170,6 +192,7 @@ def learn_from_bash(command, learned):
                         learned["patterns"].append(pattern)
                     print(f"[learn] {binary} {subcmd}", file=sys.stderr)
                     changed = True
+                break  # Only learn the first verb-like arg
         else:
             # Learn binary as safe
             if binary not in learned["safe_binaries"]:
@@ -188,7 +211,11 @@ def learn_from_bash(command, learned):
 
 def learn_from_tool(tool_name, tool_input, learned):
     """Learn that a non-Bash tool is safe to auto-approve."""
-    # For MCP tools, learn exact name
+    # Never globally learn these tools
+    if tool_name in TOOL_NEVER_LEARN:
+        return False
+
+    # MCP tools — learn exact tool name
     if tool_name.startswith("mcp__"):
         if tool_name not in learned["safe_tools"]:
             learned["safe_tools"].append(tool_name)
@@ -196,22 +223,21 @@ def learn_from_tool(tool_name, tool_input, learned):
             return True
         return False
 
-    # For Read/Edit/Write, learn a path pattern
-    if tool_name in ("Read", "Edit", "Write"):
+    # Read — learn project-scoped path pattern
+    if tool_name == "Read":
         file_path = tool_input.get("file_path", "")
         if not file_path:
             return False
-        # Try to find git root for a project-scoped pattern
         prefix = _find_project_root(file_path)
         if prefix:
-            pattern = f"{tool_name}(//{prefix}/**)"
+            pattern = f"Read(//{prefix}/**)"
             if pattern not in learned["patterns"]:
                 learned["patterns"].append(pattern)
                 print(f"[learn] {pattern}", file=sys.stderr)
                 return True
         return False
 
-    # For other tools, learn exact name
+    # Other safe tools (Skill, WebSearch, etc.) — learn exact name
     if tool_name not in learned["safe_tools"]:
         learned["safe_tools"].append(tool_name)
         print(f"[learn] safe tool: {tool_name}", file=sys.stderr)
